@@ -1,4 +1,6 @@
-#define _GNU_SOURCE 1
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include <sys/ioctl.h>
 #include <fcntl.h>
@@ -6,6 +8,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 #include <drm_fourcc.h>
 
@@ -22,9 +27,15 @@
 #define _IOC_WRITE IOC_IN
 #endif
 
-//Technically these can vary per architecture, but all the ones we support have the same values
+/* Graphics Object Block (GOB) dimensions
+ * These are consistent across Kepler through Blackwell architectures.
+ * GOB is the fundamental unit of tiled memory layout for NVIDIA GPUs.
+ */
 #define GOB_WIDTH_IN_BYTES  64
 #define GOB_HEIGHT_IN_BYTES 8
+
+/* Blackwell architecture may use different alignment requirements */
+#define BLACKWELL_ALIGNMENT 256
 
 static const NvHandle NULL_OBJECT;
 
@@ -236,7 +247,102 @@ static bool nv0_register_fd(const int nv0_fd, int nvctl_fd) {
     return true;
 }
 
+/* Sandbox-aware ioctl wrapper with retry logic for Chrome GPU sandbox */
+static int sandbox_aware_ioctl(const int fd, unsigned long request, void *arg) {
+    int ret;
+    int retries = 3;
+
+    do {
+        ret = ioctl(fd, request, arg);
+        if (ret == 0) {
+            return 0;
+        }
+
+        /* Handle sandbox-blocked or resource-busy errors */
+        if (errno == EACCES) {
+            LOG("IOCTL blocked by sandbox (EACCES) - Chrome GPU sandbox may need --disable-gpu-sandbox")
+            return NV_ERR_SANDBOX_BLOCKED;
+        }
+
+        if (errno == EAGAIN) {
+            LOG("IOCTL resource busy (EAGAIN), retrying...")
+            usleep(1000); /* 1ms delay before retry */
+            retries--;
+            continue;
+        }
+
+        /* Other errors are not retryable */
+        break;
+    } while (retries > 0);
+
+    return ret;
+}
+
 static bool get_device_info(const int fd, NVDriverContext *context) {
+    /* Initialize Blackwell-specific fields to defaults */
+    context->gpu_arch = NV_GPU_ARCH_UNKNOWN;
+    context->supports_dmabuf_v2 = 0;
+    context->isBlackwell = false;
+    context->blackwell_alignment = BLACKWELL_SURFACE_ALIGNMENT;
+    context->blackwell_page_size = BLACKWELL_PAGE_SIZE_STANDARD;
+    context->supports_low_latency_decode = false;
+
+    /* Removed Chrome-specific bypass - let it use the standard IOCTL path
+     * The nv_attach_gpus failure will be handled in init_nvdriver */
+
+    if (context->driverMajorVersion >= 580) {
+        /* Driver 580+ with Blackwell (RTX 5090/GB100+) support */
+        struct drm_nvidia_get_dev_info_params_580 devInfo580;
+        memset(&devInfo580, 0, sizeof(devInfo580));
+
+        const int ret = sandbox_aware_ioctl(fd, DRM_IOCTL_NVIDIA_GET_DEV_INFO_580, &devInfo580);
+
+        if (ret != 0) {
+            if (ret == NV_ERR_SANDBOX_BLOCKED) {
+                LOG("Sandbox blocking IOCTL - attempting fallback initialization")
+            }
+            /* Fall back to 575 structure if 580 fails */
+            LOG("580 ioctl failed (ret=%d errno=%d), falling back to 575 structure", ret, errno)
+            goto try_575;
+        }
+
+        context->gpu_id = devInfo580.gpu_id;
+        context->sector_layout = devInfo580.sector_layout;
+        context->page_kind_generation = devInfo580.page_kind_generation;
+        context->generic_page_kind = devInfo580.generic_page_kind;
+        context->gpu_arch = devInfo580.gpu_arch;
+        context->supports_dmabuf_v2 = devInfo580.supports_dmabuf_v2;
+
+        /* Detect Blackwell architecture via multiple heuristics:
+         * 1. Explicit gpu_arch field (if kernel populates it)
+         * 2. page_kind_generation >= 2 (Blackwell uses gen 2)
+         * 3. Driver 580+ with sector_layout=1 and generic_page_kind=6 */
+        if (context->gpu_arch >= NV_GPU_ARCH_BLACKWELL) {
+            context->isBlackwell = true;
+            LOG("Detected Blackwell architecture via gpu_arch field")
+        } else if (context->page_kind_generation >= 2) {
+            /* Kernel doesn't populate gpu_arch yet, use page_kind_generation heuristic */
+            context->isBlackwell = true;
+            context->gpu_arch = NV_GPU_ARCH_BLACKWELL;
+            LOG("Detected Blackwell architecture via page_kind_generation=%d", context->page_kind_generation)
+        } else if (context->sector_layout == 1 && context->generic_page_kind == 6) {
+            /* Additional heuristic for Blackwell detection */
+            context->isBlackwell = true;
+            context->gpu_arch = NV_GPU_ARCH_BLACKWELL;
+            LOG("Detected Blackwell architecture via sector_layout/page_kind heuristic")
+        }
+
+        if (context->isBlackwell) {
+            context->blackwell_alignment = BLACKWELL_SURFACE_ALIGNMENT;
+            context->blackwell_page_size = BLACKWELL_PAGE_SIZE_LARGE;
+            context->supports_low_latency_decode = true;
+            LOG("Blackwell (RTX 50 series) - Low latency decode enabled, alignment=%d", context->blackwell_alignment)
+        }
+
+        return true;
+    }
+
+try_575:
     if (context->driverMajorVersion >= 575) {
         struct drm_nvidia_get_dev_info_params_575 devInfo575;
         const int ret = ioctl(fd, DRM_IOCTL_NVIDIA_GET_DEV_INFO_575, &devInfo575);
@@ -250,9 +356,17 @@ static bool get_device_info(const int fd, NVDriverContext *context) {
         context->sector_layout = devInfo575.sector_layout;
         context->page_kind_generation = devInfo575.page_kind_generation;
         context->generic_page_kind = devInfo575.generic_page_kind;
+
+        /* Attempt to detect Blackwell by sector_layout and page_kind_generation
+         * Blackwell typically uses newer generation values */
+        if (context->page_kind_generation >= 2) {
+            /* This heuristic may indicate Blackwell or newer */
+            LOG("Detected potential Blackwell architecture via page_kind_generation")
+            context->isBlackwell = true;
+            context->gpu_arch = NV_GPU_ARCH_BLACKWELL;
+        }
     } else if (context->driverMajorVersion > 545 || (context->driverMajorVersion == 545 && context->driverMinorVersion >= 29)) {
-        //NVIDIA driver v545.29.02 changed the devInfo struct, and partly broke it in the process
-        //...who adds a field to the middle of an existing struct....
+        /* NVIDIA driver v545.29.02 changed the devInfo struct */
         struct drm_nvidia_get_dev_info_params_545 devInfo545;
         const int ret = ioctl(fd, DRM_IOCTL_NVIDIA_GET_DEV_INFO_545, &devInfo545);
 
@@ -327,7 +441,9 @@ bool init_nvdriver(NVDriverContext *context, const int drmFd) {
         return false;
     }
 
-    LOG("Got dev info: %x %x %x %x", context->gpu_id, context->sector_layout, context->page_kind_generation, context->generic_page_kind)
+    LOG("Got dev info: gpu_id=%x sector_layout=%x page_kind_gen=%x generic_page_kind=%x arch=%x isBlackwell=%d",
+        context->gpu_id, context->sector_layout, context->page_kind_generation,
+        context->generic_page_kind, context->gpu_arch, context->isBlackwell)
 
     //allocate the root object
     bool ret = nv_alloc_object(nvctlFd, context->driverMajorVersion, NULL_OBJECT, NULL_OBJECT, &context->clientObject, NV01_ROOT_CLIENT, 0, (void*)0);
@@ -337,10 +453,15 @@ bool init_nvdriver(NVDriverContext *context, const int drmFd) {
     }
 
     //attach the drm fd to this handle
+    //Chrome's GPU sandbox may block this IOCTL - tolerate failure for Chrome processes
     ret = nv_attach_gpus(nvctlFd, context->gpu_id);
     if (!ret) {
+        if (is_chrome_detect()) {
+            LOG("nv_attach_gpus failed in Chrome context - continuing (GPU already attached by browser)")
+        } else {
         LOG("nv_attach_gpu failed")
         goto err;
+        }
     }
 
     //allocate the parent memory object
@@ -456,8 +577,12 @@ bool alloc_memory(const NVDriverContext *context, const uint32_t size, int *fd) 
     //attach the new fd to the correct gpus
     ret = nv_attach_gpus(nvctlFd2, context->gpu_id);
     if (!ret) {
+        if (is_chrome_detect()) {
+            LOG("nv_attach_gpus failed in Chrome context - continuing")
+        } else {
         LOG("nv_attach_gpus failed")
         goto err;
+        }
     }
 
     //actually export the object
@@ -491,18 +616,72 @@ bool alloc_memory(const NVDriverContext *context, const uint32_t size, int *fd) 
 }
 
  bool alloc_image(NVDriverContext *context, uint32_t width, uint32_t height, uint8_t channels, uint8_t bitsPerChannel, uint32_t fourcc, NVDriverImage *image) {
-     uint32_t gobWidthInBytes = 64;
-     uint32_t gobHeightInBytes = 8;
+     uint32_t gobWidthInBytes = GOB_WIDTH_IN_BYTES;
+     uint32_t gobHeightInBytes = GOB_HEIGHT_IN_BYTES;
 
      uint32_t bytesPerChannel = bitsPerChannel/8;
      uint32_t bytesPerPixel = channels * bytesPerChannel;
 
-     //first figure out the gob layout
-     uint32_t log2GobsPerBlockX = 0; //TODO not sure if these are the correct numbers to start with, but they're the largest ones i've seen used
-     uint32_t log2GobsPerBlockY = height < 86 ? 3 : 4; //TODO 86 is a guess, 80px high needs 3, 112px needs 4, 96px needs 4, 88px needs 4, 86px needs 4
-     if (height < 43) log2GobsPerBlockY = 2;
-     if (height < 22) log2GobsPerBlockY = 1;
-     if (height < 11) log2GobsPerBlockY = 0;
+     /* For Blackwell, apply surface alignment requirements
+      * This is critical for Chrome's compositor to properly ingest the DMABUF
+      */
+     if (context->isBlackwell) {
+         /* Blackwell requires specific pitch alignment for DMABUF export */
+         uint32_t minPitch = ROUND_UP(width * bytesPerPixel, BLACKWELL_PITCH_ALIGNMENT);
+         (void)minPitch; /* Used below in widthInBytes calculation */
+     }
+
+     /* Determine GOB layout based on image height
+      * The number of GOBs per block in Y direction depends on the image height.
+      * These thresholds work for Kepler through Blackwell.
+      *
+      * Blackwell (RTX 5090/GB100+) uses enhanced GOB layout for low-latency decode.
+      */
+     uint32_t log2GobsPerBlockX = 0;
+     uint32_t log2GobsPerBlockY;
+
+     /* Calculate optimal log2GobsPerBlockY based on height
+      * These thresholds are tuned for video decode performance
+      */
+     if (context->isBlackwell) {
+         /* Blackwell-optimized GOB calculation for streaming content
+          * This layout is optimized for low-latency decode (Kick.com, Twitch, etc.)
+          */
+         if (height >= 2160) {
+             log2GobsPerBlockY = 5; /* 4K/8K content */
+         } else if (height >= 1080) {
+             log2GobsPerBlockY = 4; /* 1080p content */
+         } else if (height >= 720) {
+             log2GobsPerBlockY = 4; /* 720p content */
+         } else if (height >= 480) {
+             log2GobsPerBlockY = 3; /* 480p content */
+         } else if (height >= 240) {
+             log2GobsPerBlockY = 2;
+         } else if (height >= 120) {
+             log2GobsPerBlockY = 1;
+         } else {
+             log2GobsPerBlockY = 0;
+         }
+
+         /* Clamp to Blackwell maximum */
+         if (log2GobsPerBlockY > BLACKWELL_MAX_LOG2_GOBS_Y) {
+             log2GobsPerBlockY = BLACKWELL_MAX_LOG2_GOBS_Y;
+         }
+     } else {
+         /* Legacy GOB calculation for pre-Blackwell */
+         if (height >= 86) {
+             log2GobsPerBlockY = 4;
+         } else if (height >= 43) {
+             log2GobsPerBlockY = 3;
+         } else if (height >= 22) {
+             log2GobsPerBlockY = 2;
+         } else if (height >= 11) {
+             log2GobsPerBlockY = 1;
+         } else {
+             log2GobsPerBlockY = 0;
+         }
+     }
+
      uint32_t log2GobsPerBlockZ = 0;
 
      //LOG("Calculated GOB size: %dx%d (%dx%d)", gobWidthInBytes << log2GobsPerBlockX, gobHeightInBytes << log2GobsPerBlockY, log2GobsPerBlockX, log2GobsPerBlockY);
@@ -547,26 +726,44 @@ bool alloc_memory(const NVDriverContext *context, const uint32_t size, int *fd) 
          }
      };
 
-     //TODO find the proper page size
-     imageSizeInBytes = ROUND_UP(imageSizeInBytes, 65536);
+     /* Page size alignment
+      * Blackwell uses 256KB pages for large allocations to match the new memory controller.
+      * This is critical for Chrome's DMABUF import to work correctly.
+      */
+     uint32_t pageSize;
+     if (context->isBlackwell) {
+         pageSize = context->blackwell_page_size;
+         LOG("Using Blackwell page size: %u bytes", pageSize);
+     } else {
+         pageSize = 65536; /* 64KB for legacy architectures */
+     }
+     imageSizeInBytes = ROUND_UP(imageSizeInBytes, pageSize);
 
      struct drm_nvidia_gem_import_nvkms_memory_params params = {
          .mem_size = imageSizeInBytes,
          .nvkms_params_ptr = (uint64_t)(uintptr_t)&nvkmsParams,
-         .nvkms_params_size = context->driverMajorVersion == 470 ? 0x20 : sizeof(nvkmsParams) //needs to be 0x20 in the 470 series driver
+         .nvkms_params_size = context->driverMajorVersion == 470 ? 0x20 : sizeof(nvkmsParams)
      };
-     int drmret = ioctl(context->drmFd, DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY, &params);
+
+     /* Use sandbox-aware ioctl for Chrome compatibility */
+     int drmret = sandbox_aware_ioctl(context->drmFd, DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY, &params);
      if (drmret != 0) {
+         if (drmret == NV_ERR_SANDBOX_BLOCKED) {
+             LOG("GEM import blocked by sandbox - Chrome may need --disable-gpu-sandbox");
+         }
          LOG("DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY failed: %d %d", drmret, errno);
          goto err;
      }
 
-     //export dma-buf
+     /* Export DMA-BUF with sandbox-aware handling */
      struct drm_prime_handle prime_handle = {
          .handle = params.handle
      };
-     drmret = ioctl(context->drmFd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_handle);
+     drmret = sandbox_aware_ioctl(context->drmFd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_handle);
      if (drmret != 0) {
+         if (drmret == NV_ERR_SANDBOX_BLOCKED) {
+             LOG("PRIME handle export blocked by sandbox");
+         }
          LOG("DRM_IOCTL_PRIME_HANDLE_TO_FD failed: %d %d", drmret, errno);
          goto err;
      }

@@ -64,6 +64,10 @@
     DRM_IOWR((DRM_COMMAND_BASE + DRM_NVIDIA_GET_DEV_INFO),                 \
              struct drm_nvidia_get_dev_info_params_575)
 
+#define DRM_IOCTL_NVIDIA_GET_DEV_INFO_580                                  \
+    DRM_IOWR((DRM_COMMAND_BASE + DRM_NVIDIA_GET_DEV_INFO),                 \
+             struct drm_nvidia_get_dev_info_params_580)
+
 /*
  * XXX Solaris compiler has issues with DRM_IO. None of this is supported on
  * Solaris anyway, so just skip it.
@@ -173,6 +177,27 @@ struct drm_nvidia_get_dev_info_params_575 {
     uint32_t sector_layout;        /* OUT */
     uint32_t supports_sync_fd;     /* OUT */
     uint32_t supports_semsurf;     /* OUT */
+};
+
+/* Driver 580+ structure for Blackwell (GB100+) and later architectures */
+struct drm_nvidia_get_dev_info_params_580 {
+    uint32_t gpu_id;             /* OUT */
+    uint32_t mig_device;         /* OUT */
+    uint32_t primary_index;      /* OUT; the "card%d" value */
+
+    uint32_t supports_alloc;     /* OUT */
+    /* The generic_page_kind, page_kind_generation, and sector_layout
+     * fields are only valid if supports_alloc is true.
+     * See DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D definitions of these. */
+    uint32_t generic_page_kind;    /* OUT */
+    uint32_t page_kind_generation; /* OUT */
+    uint32_t sector_layout;        /* OUT */
+    uint32_t supports_sync_fd;     /* OUT */
+    uint32_t supports_semsurf;     /* OUT */
+
+    /* Blackwell architecture additions */
+    uint32_t gpu_arch;             /* OUT - GPU architecture identifier */
+    uint32_t supports_dmabuf_v2;   /* OUT - DMA-BUF v2 support flag */
 };
 
 

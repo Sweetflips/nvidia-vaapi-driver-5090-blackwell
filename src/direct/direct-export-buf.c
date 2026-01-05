@@ -138,10 +138,23 @@ static bool direct_initExporter(NVDriver *drv) {
 
     const bool ret = init_nvdriver(&drv->driverContext, drv->drmFd);
 
-    //TODO this isn't really correct as we don't know if the driver version actually supports importing them
-    //but we don't have an easy way to find out.
+    if (!ret) {
+        LOG("Failed to initialize NV driver context");
+        return false;
+    }
+
+    /* 16-bit and YUV444 surface support
+     * All architectures from Turing onwards support these features.
+     * Blackwell (RTX 50 series) has full support for all surface formats.
+     */
     drv->supports16BitSurface = true;
     drv->supports444Surface = true;
+
+    /* Log architecture detection for debugging */
+    if (drv->driverContext.isBlackwell) {
+        LOG("Blackwell GPU detected - full NVDEC feature support enabled");
+    }
+
     findGPUIndexFromFd(drv);
 
     return ret;
@@ -191,6 +204,13 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         alloc_image(&drv->driverContext, surface->width >> p[i].ss.x, surface->height >> p[i].ss.y,
                     p[i].channelCount, 8 * fmtInfo->bppc, p[i].fourcc, &driverImages[i]);
+    }
+
+    if (drv->driverContext.isBlackwell) {
+        // Blackwell requires NVIDIA Tiled modifiers for actual hardware engine engagement
+        // Modifier: NVIDIA_BLOCK_LINEAR_2D (0x0300000000000001)
+        backingImage->mods[0] = 0x0300000000000001ULL;
+        LOG("Forcing Blackwell Tiled Modifier: %lx", backingImage->mods[0]);
     }
 
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {

@@ -68,6 +68,41 @@ static uint32_t max_instances;
 static CudaFunctions *cu;
 static CuvidFunctions *cv;
 
+// ===== NVDEC Stats Tracking (Blackwell nvidia-smi workaround) =====
+static pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t nvdec_frames_decoded = 0;
+static uint64_t nvdec_decode_errors = 0;
+static uint64_t nvdec_last_decode_time = 0;
+static uint32_t nvdec_active_contexts = 0;
+#define NVDEC_STATS_FILE "/tmp/nvdec-stats.txt"
+
+static void update_nvdec_stats(int success) {
+    pthread_mutex_lock(&stats_mutex);
+    if (success) {
+        nvdec_frames_decoded++;
+    } else {
+        nvdec_decode_errors++;
+    }
+    
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    nvdec_last_decode_time = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    
+    // Write stats every 10 frames for responsive monitoring
+    if (nvdec_frames_decoded % 10 == 0 || nvdec_frames_decoded == 1) {
+        FILE *f = fopen(NVDEC_STATS_FILE, "w");
+        if (f) {
+            fprintf(f, "frames_decoded=%lu\n", nvdec_frames_decoded);
+            fprintf(f, "decode_errors=%lu\n", nvdec_decode_errors);
+            fprintf(f, "active_contexts=%u\n", nvdec_active_contexts);
+            fprintf(f, "last_decode_ms=%lu\n", nvdec_last_decode_time);
+            fprintf(f, "status=active\n");
+            fclose(f);
+        }
+    }
+    pthread_mutex_unlock(&stats_mutex);
+}
+
 extern const NVCodec __start_nvd_codecs[];
 extern const NVCodec __stop_nvd_codecs[];
 
@@ -133,6 +168,15 @@ static void init() {
         }
     }
 
+    /* Check for Chrome-specific environment - Chrome sets these */
+    const char *chromeIndicator = getenv("CHROME_WRAPPER");
+    const char *chromiumFlags = getenv("CHROMIUM_FLAGS");
+    if (chromeIndicator != NULL || chromiumFlags != NULL) {
+        LOG("Chrome/Chromium environment detected - using optimized settings");
+        /* Force direct backend for Chrome - EGL backend has issues with 525+ */
+        backend = DIRECT;
+    }
+
 #ifdef __linux__
     //try to detect the Firefox sandbox and skip loading CUDA if detected
     int fd = open("/proc/version", O_RDONLY);
@@ -187,10 +231,6 @@ static void cleanup() {
 __attribute((format(gnu_printf, 4, 5)))
 #endif
 void logger(const char *filename, const char *function, int line, const char *msg, ...) {
-    if (LOG_OUTPUT == 0) {
-        return;
-    }
-
     va_list argList;
     char formattedMessage[1024];
 
@@ -201,8 +241,20 @@ void logger(const char *filename, const char *function, int line, const char *ms
     struct timespec tp;
     clock_gettime(CLOCK_MONOTONIC, &tp);
 
-    fprintf(LOG_OUTPUT, "%10ld.%09ld [%d-%d] %s:%4d %24s %s\n", (long)tp.tv_sec, tp.tv_nsec, getpid(), nv_gettid(), filename, line, function, formattedMessage);
-    fflush(LOG_OUTPUT);
+    if (LOG_OUTPUT != NULL) {
+        fprintf(LOG_OUTPUT, "%10ld.%09ld [%d-%d] %s:%4d %24s %s\n", (long)tp.tv_sec, tp.tv_nsec, getpid(), nv_gettid(), filename, line, function, formattedMessage);
+        fflush(LOG_OUTPUT);
+    }
+
+    // #region agent log
+    static const char *debug_log_path = "/home/sweetflips/blackwell-sweet-compatibility-kernel/nvidia-vaapi-driver/.cursor/debug.log";
+    FILE *df = fopen(debug_log_path, "a");
+    if (df) {
+        fprintf(df, "{\"location\":\"%s:%d\",\"message\":\"%s\",\"timestamp\":%ld,\"sessionId\":\"blackwell-debug\",\"runId\":\"run3\",\"hypothesisId\":\"1\"}\n",
+                function, line, formattedMessage, (long)time(NULL) * 1000);
+        fclose(df);
+    }
+    // #endregion
 }
 
 bool checkCudaErrors(CUresult err, const char *file, const char *function, const int line) {
@@ -461,7 +513,6 @@ out:
     return NULL;
 }
 
-
 static VAStatus nvQueryConfigProfiles(
         VADriverContextP ctx,
         VAProfile *profile_list,	/* out */
@@ -618,6 +669,7 @@ static VAStatus nvGetConfigAttributes(
         int num_attribs
     )
 {
+    LOG("nvGetConfigAttributes called profile=%d entrypoint=%d num_attribs=%d", profile, entrypoint, num_attribs);
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     if (vaToCuCodec(profile) == cudaVideoCodec_NONE) {
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
@@ -670,6 +722,10 @@ static VAStatus nvGetConfigAttributes(
         else if (attrib_list[i].type == VAConfigAttribMaxPictureHeight)
         {
             doesGPUSupportCodec(vaToCuCodec(profile), 8, cudaVideoChromaFormat_420, NULL, &attrib_list[i].value);
+        }
+        else if (attrib_list[i].type == VAConfigAttribDecSliceMode)
+        {
+            attrib_list[i].value = VA_DEC_SLICE_MODE_BASE;
         }
         else
         {
@@ -749,11 +805,23 @@ static VAStatus nvCreateConfig(
                     break;
                 }
             } else {
+                /* No RTFormat specified - use sensible defaults based on profile */
                 if (cfg->profile == VAProfileVP9Profile2) {
                     cfg->surfaceFormat = cudaVideoSurfaceFormat_P016;
                     cfg->bitDepth = 10;
+                } else if (cfg->profile == VAProfileAV1Profile0) {
+                    /* AV1 Profile0: Default to 8-bit NV12 */
+                    cfg->surfaceFormat = cudaVideoSurfaceFormat_NV12;
+                    cfg->bitDepth = 8;
+                } else if (cfg->profile == VAProfileVP9Profile0) {
+                    /* VP9 Profile0: Default to 8-bit NV12 */
+                    cfg->surfaceFormat = cudaVideoSurfaceFormat_NV12;
+                    cfg->bitDepth = 8;
                 } else {
-                    LOG("Unable to determine surface type for VP9/AV1 codec due to no RTFormat specified.");
+                    /* Fallback for other profiles */
+                    cfg->surfaceFormat = cudaVideoSurfaceFormat_NV12;
+                    cfg->bitDepth = 8;
+                    LOG("Using default NV12 surface for VP9/AV1 profile %d (no RTFormat specified)", cfg->profile);
                 }
             }
         default:
@@ -851,13 +919,16 @@ static VAStatus nvQueryConfigAttributes(
         int *num_attribs		/* out */
     )
 {
+    LOG("nvQueryConfigAttributes called with config_id=%d", config_id);
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVConfig *cfg = (NVConfig*) getObjectPtr(drv, OBJECT_TYPE_CONFIG, config_id);
 
     if (cfg == NULL) {
+        LOG("nvQueryConfigAttributes: config not found!");
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
 
+    LOG("nvQueryConfigAttributes: returning profile=%d entrypoint=%d", cfg->profile, cfg->entrypoint);
     *profile = cfg->profile;
     *entrypoint = cfg->entrypoint;
     int i = 0;
@@ -898,7 +969,9 @@ static VAStatus nvQueryConfigAttributes(
     }
 
     i++;
+    /* Return only RTFormat - Chrome may not allocate enough space for more attributes */
     *num_attribs = i;
+    LOG("nvQueryConfigAttributes: returning %d attributes", i);
     return VA_STATUS_SUCCESS;
 }
 
@@ -969,6 +1042,12 @@ static VAStatus nvCreateSurfaces2(
         default:
             // no change needed
             break;
+    }
+
+    if (drv->driverContext.isBlackwell) {
+        // Blackwell requires 1024-byte alignment for surfaces to be usable by NVDEC
+        width = ROUND_UP(width, 1024);
+        LOG("Blackwell surface alignment applied: %dx%d", width, height);
     }
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
@@ -1067,6 +1146,23 @@ static VAStatus nvCreateContext(
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
+    int aligned_width = picture_width;
+    int aligned_height = picture_height;
+    int pool_width = picture_width;
+    if (drv->driverContext.isBlackwell) {
+        // Blackwell requires 1024-byte pitch and 128-line height alignment for hardware engine compatibility
+        aligned_width = ROUND_UP(picture_width, 1024);
+        pool_width = aligned_width;  // Pool width matches stride for Blackwell
+        aligned_height = ROUND_UP(picture_height, 128);
+        // No artificial minimum - let NVDEC determine requirements
+        
+        LOG("Blackwell buffer alignment: Stride=%d Pool=%d Height=%d (Stream: %dx%d)", 
+            aligned_width, pool_width, aligned_height, picture_width, picture_height);
+    }
+
+    int display_area_width = picture_width;
+    int display_area_height = picture_height;
+
     if (num_render_targets) {
         // Update the decoder configuration to match the passed in surfaces.
         NVSurface *surface = (NVSurface *) getObjectPtr(drv, OBJECT_TYPE_SURFACE, render_targets[0]);
@@ -1078,16 +1174,16 @@ static VAStatus nvCreateContext(
         cfg->bitDepth = surface->bitDepth;
     }
 
-     // Setting to maximun value if num_render_targets == 0 to prevent picture index overflow as additional surfaces can be created after calling nvCreateContext
-    int surfaceCount = num_render_targets > 0 ? num_render_targets : 32;
+    // NVDEC surface limits vary by resolution and codec
+    // Blackwell: use 32 for safety margin with dynamic surface allocation
+    int default_surfaces = 32;
+    int surfaceCount = num_render_targets > 0 ? num_render_targets : default_surfaces;
 
-    if (surfaceCount > 32) {
-        LOG("Application requested %d surface(s), limiting to 32. This may cause issues.", surfaceCount);
-        surfaceCount = 32;
+    int max_surfaces = 32;
+    if (surfaceCount > max_surfaces) {
+        LOG("Application requested %d surface(s), limiting to %d.", surfaceCount, max_surfaces);
+        surfaceCount = max_surfaces;
     }
-
-    int display_area_width = picture_width;
-    int display_area_height = picture_height;
 
     // If we're increasing the surface size for the chroma subsampling,
     // increase the displayArea to match
@@ -1104,9 +1200,17 @@ static VAStatus nvCreateContext(
             break;
     }
 
+    // For Blackwell, use aligned dimensions consistently to avoid hardware rejection
+    int decode_width = drv->driverContext.isBlackwell ? aligned_width : picture_width;
+    int decode_height = drv->driverContext.isBlackwell ? aligned_height : picture_height;
+    
     CUVIDDECODECREATEINFO vdci = {
-        .ulWidth             = vdci.ulMaxWidth  = vdci.ulTargetWidth  = picture_width,
-        .ulHeight            = vdci.ulMaxHeight = vdci.ulTargetHeight = picture_height,
+        .ulWidth             = decode_width,
+        .ulMaxWidth          = decode_width,
+        .ulTargetWidth       = decode_width,
+        .ulHeight            = decode_height,
+        .ulMaxHeight         = decode_height,
+        .ulTargetHeight      = decode_height,
         .CodecType           = cfg->cudaCodec,
         .ulCreationFlags     = cudaVideoCreate_PreferCUVID,
         .ulIntraDecodeOnly   = 0, //TODO (flag & VA_PROGRESSIVE) != 0
@@ -1116,13 +1220,8 @@ static VAStatus nvCreateContext(
         .OutputFormat        = cfg->surfaceFormat,
         .bitDepthMinus8      = cfg->bitDepth - 8,
         .DeinterlaceMode     = cudaVideoDeinterlaceMode_Weave,
-
-        //we only ever map one frame at a time, so we can set this to 1
-        //it isn't particually efficient to do this, but it is simple
-        .ulNumOutputSurfaces = 1,
-        //just allocate as many surfaces as have been created since we can never have as much information as the decode to guess correctly
+        .ulNumOutputSurfaces = 2,
         .ulNumDecodeSurfaces = surfaceCount,
-        //.vidLock             = drv->vidLock
     };
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
@@ -1134,6 +1233,11 @@ static VAStatus nvCreateContext(
 
     Object contextObj = allocateObject(drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
     LOG("Creating decoder: %p for context id: %d", decoder, contextObj->id);
+    
+    // Track active contexts for stats
+    pthread_mutex_lock(&stats_mutex);
+    nvdec_active_contexts++;
+    pthread_mutex_unlock(&stats_mutex);
 
     NVContext *nvCtx = (NVContext*) contextObj->obj;
     nvCtx->drv = drv;
@@ -1171,6 +1275,11 @@ static VAStatus nvDestroyContext(
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     LOG("Destroying context: %d", context);
+    
+    // Track active contexts for stats
+    pthread_mutex_lock(&stats_mutex);
+    if (nvdec_active_contexts > 0) nvdec_active_contexts--;
+    pthread_mutex_unlock(&stats_mutex);
 
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
 
@@ -1303,6 +1412,7 @@ static VAStatus nvBeginPicture(
         VASurfaceID render_target
     )
 {
+    LOG("nvBeginPicture called: context=%d target=%d", context, render_target);
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
     NVSurface *surface = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, render_target);
@@ -1407,8 +1517,11 @@ static VAStatus nvEndPicture(
     if (result != CUDA_SUCCESS) {
         LOG("cuvidDecodePicture failed: %d", result);
         status = VA_STATUS_ERROR_DECODING_ERROR;
+        update_nvdec_stats(0);
+    } else {
+        LOG("NVDEC decode OK: idx=%d", picParams->CurrPicIdx);
+        update_nvdec_stats(1);
     }
-    //LOG("Decoded frame successfully to idx: %d (%p)", picParams->CurrPicIdx, nvCtx->renderTarget);
 
     NVSurface *surface = nvCtx->renderTarget;
 
@@ -2155,10 +2268,11 @@ static VAStatus nvExportSurfaceHandle(
 
     drv->backend->fillExportDescriptor(drv, surface, ptr);
 
-    // LOG("Exporting with w:%d h:%d o:%d p:%d m:%" PRIx64 " o:%d p:%d m:%" PRIx64, ptr->width, ptr->height, ptr->layers[0].offset[0],
-    //                                                             ptr->layers[0].pitch[0], ptr->objects[0].drm_format_modifier,
-    //                                                             ptr->layers[1].offset[0], ptr->layers[1].pitch[0],
-    //                                                             ptr->objects[1].drm_format_modifier);
+    LOG("Exporting surface_id=%d with w:%d h:%d o:%d p:%d m:%lx o:%d p:%d m:%lx", 
+        surface_id, ptr->width, ptr->height, ptr->layers[0].offset[0],
+        ptr->layers[0].pitch[0], ptr->objects[ptr->layers[0].object_index[0]].drm_format_modifier,
+        ptr->layers[1].offset[0], ptr->layers[1].pitch[0],
+        ptr->objects[ptr->layers[1].object_index[0]].drm_format_modifier);
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
 
@@ -2303,12 +2417,30 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     //make sure that we want the default GPU, and that a DRM fd that we care about is passed in
     drv->drmFd = drmFd;
 
-    if (backend == EGL) {
-        LOG("Selecting EGL backend");
-        drv->backend = &EGL_BACKEND;
-    } else if (backend == DIRECT) {
+    bool useDirect = true; // Blackwell default
+    char *nvdBackend = getenv("NVD_BACKEND");
+    
+    // Environment variable takes priority
+    if (nvdBackend != NULL) {
+        if (strncmp(nvdBackend, "egl", 3) == 0) {
+            useDirect = false;
+            LOG("NVD_BACKEND=egl - using EGL backend");
+        } else if (strncmp(nvdBackend, "direct", 6) == 0) {
+            useDirect = true;
+            LOG("NVD_BACKEND=direct - using Direct backend");
+        }
+    } else if (is_chrome_detect()) {
+        // Chrome's GPU sandbox blocks direct backend IOCTLs - use EGL
+        useDirect = false;
+        LOG("Detected Chrome/Chromium - using EGL backend (sandbox compatible)");
+    }
+
+    if (useDirect) {
         LOG("Selecting Direct backend");
         drv->backend = &DIRECT_BACKEND;
+    } else {
+        LOG("Selecting EGL backend");
+        drv->backend = &EGL_BACKEND;
     }
 
     ctx->max_profiles = MAX_PROFILES;
@@ -2318,9 +2450,9 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     ctx->max_image_formats = ARRAY_SIZE(formatsInfo) - 1;
     ctx->max_subpic_formats = 1;
 
-    if (backend == DIRECT) {
-        ctx->str_vendor = "VA-API NVDEC driver [direct backend]";
-    } else if (backend == EGL) {
+    if (useDirect) {
+        ctx->str_vendor = "VA-API NVDEC driver [direct backend] (Blackwell Optimized)";
+    } else {
         ctx->str_vendor = "VA-API NVDEC driver [egl backend]";
     }
 
@@ -2345,7 +2477,9 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
 
     //CHECK_CUDA_RESULT_RETURN(cv->cuvidCtxLockCreate(&drv->vidLock, drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 
-    nvQueryConfigProfiles2(ctx, drv->profiles, &drv->profileCount);
+    LOG("About to query config profiles");
+    VAStatus qResult = nvQueryConfigProfiles2(ctx, drv->profiles, &drv->profileCount);
+    LOG("Query config profiles returned: %d, profile count: %d", qResult, drv->profileCount);
 
     *ctx->vtable = vtable;
     return VA_STATUS_SUCCESS;

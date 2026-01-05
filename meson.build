@@ -29,6 +29,7 @@ gst_codecs_deps = dependency('gstreamer-codecparsers-1.0', required: false)
 if cc.get_argument_syntax() == 'gcc'
     add_project_arguments(
         cc.get_supported_arguments([
+            '-D_GNU_SOURCE',
             '-Wno-missing-field-initializers',
             '-Wno-unused-parameter',
             '-Werror=format',
