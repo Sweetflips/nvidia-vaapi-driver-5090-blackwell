@@ -1,12 +1,15 @@
 # nvidia-vaapi-driver
 
-This is an VA-API implementation that uses NVDEC as a backend. This implementation is specifically designed to be used by Firefox for accelerated decode of web content, and may not operate correctly in other applications.
+**Exclusive to Sweetflips** — RTX 5090 Blackwell fork with GB202/GB203 support for kernel 6.17+
+
+VA-API implementation using NVDEC backend. Built for Firefox hardware-accelerated web video decode. Other applications untested.
 
 # Table of contents
 
 - [nvidia-vaapi-driver](#nvidia-vaapi-driver)
 - [Table of contents](#table-of-contents)
 - [Codec Support](#codec-support)
+- [GPU Generation Support](#gpu-generation-support)
 - [Installation](#installation)
   - [Packaging status](#packaging-status)
   - [Building](#building)
@@ -16,78 +19,75 @@ This is an VA-API implementation that uses NVDEC as a backend. This implementati
   - [Kernel parameters](#kernel-parameters)
   - [Environment Variables](#environment-variables)
   - [Firefox](#firefox)
-  - [Chrome](#chrome)
+  - [Chromium-Based Browsers](#chromium-based-browsers)
   - [MPV](#mpv)
   - [Direct Backend](#direct-backend)
 - [Testing](#testing)
+- [Blackwell-Specific Notes](#blackwell-specific-notes)
 
 # Codec Support
 
-Hardware decoding only, encoding is [not supported](/../../issues/116).
+Hardware decoding only. Encoding [not supported](/../../issues/116).
 
-| Codec | Supported | Comments |
+| Codec | Status | Notes |
 |---|---|---|
-|AV1|:heavy_check_mark:|Firefox 98+ is required.|
-|H.264|:heavy_check_mark:||
-|HEVC|:heavy_check_mark:|Some distros are shipping Firefox and/or FFMPEG with HEVC support disabled due to patent concerns.|
-|VP8|:heavy_check_mark:||
-|VP9|:heavy_check_mark:|Requires being compiled with `gstreamer-codecparsers-1.0`|
-|MPEG-2|:heavy_check_mark:||
-|VC-1|:heavy_check_mark:||
-|MPEG-4|:x:|VA-API does not supply enough of the original bitstream to allow NVDEC to decode it.|
-|JPEG|:x:|This is unlikely to ever work, the two APIs are too different.|
+| AV1 | ✓ | Firefox 98+ required |
+| H.264 | ✓ | |
+| HEVC | ✓ | Some distros ship Firefox/FFMPEG with HEVC disabled (patent concerns) |
+| VP8 | ✓ | |
+| VP9 | ✓ | Requires `gstreamer-codecparsers-1.0` at compile time |
+| MPEG-2 | ✓ | |
+| VC-1 | ✓ | |
+| MPEG-4 | ✗ | VA-API lacks sufficient bitstream data for NVDEC |
+| JPEG | ✗ | API mismatch prevents implementation |
 
-YUV444 is supported but requires:
+YUV444 requirements:
+- Turing or newer (20XX/16XX/30XX/40XX/50XX including Blackwell)
+- HEVC codec
+- Direct backend
 
-* \>= Turing (20XX/16XX) including Blackwell (50XX)
-* HEVC
-* Direct backend
+# GPU Generation Support
 
-## GPU Generation Support
+| Generation | Series | Status | Driver Requirement |
+|---|---|---|---|
+| Kepler | GTX 600/700 | Supported | 470+ |
+| Maxwell | GTX 900/Titan X | Supported | 470+ |
+| Pascal | GTX 10XX | Supported | 470+ |
+| Volta | Titan V | Supported | 470+ |
+| Turing | RTX 20XX/GTX 16XX | Supported | 470+ |
+| Ampere | RTX 30XX | Supported | 470+ |
+| Ada Lovelace | RTX 40XX | Supported | 525+ |
+| Blackwell | RTX 50XX (5090/5080) | Supported | 580+ |
 
-| Generation | Series | Status |
-|---|---|---|
-| Kepler | GTX 600/700 | Supported |
-| Maxwell | GTX 900/Titan X | Supported |
-| Pascal | GTX 10XX | Supported |
-| Volta | Titan V | Supported |
-| Turing | RTX 20XX/GTX 16XX | Supported |
-| Ampere | RTX 30XX | Supported |
-| Ada Lovelace | RTX 40XX | Supported |
-| Blackwell | RTX 50XX (5090, etc.) | Supported (driver 580+) |
+Blackwell GPUs (GB202/GB203) require driver 580.0 or newer. Older drivers lack NVDEC interface definitions for these chips.
 
-To view which codecs your card is capable of decoding you can use the `vainfo` command with this driver installed, or visit the NVIDIA website [here](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new#geforce).
+Check codec support: run `vainfo` with this driver, or see [NVIDIA's decode matrix](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new#geforce).
 
 # Installation
 
-To install and use `nvidia-vaapi-driver`, follow the steps in installation and configuration. It is recommended to follow testing as well to verify hardware acceleration is working as intended.
-
-**Requirements**
-
-* NVIDIA driver series 470 or 500+ (580+ required for Blackwell/RTX 50XX GPUs)
-* For RTX 5090 and other Blackwell GPUs: Driver version 580.0 or newer is required
+**Driver Requirements:**
+- Series 470 or 500+ for pre-Blackwell
+- Series 580+ for RTX 5090/5080 (Blackwell)
 
 ## Packaging status
 
 <p align="top"><a href="https://repology.org/project/nvidia-vaapi-driver/versions"><img src="https://repology.org/badge/vertical-allrepos/nvidia-vaapi-driver.svg" alt="repology"><a href="https://repology.org/project/libva-nvidia-driver/versions"><img src="https://repology.org/badge/vertical-allrepos/libva-nvidia-driver.svg" alt="repology" align="top" width="%"></p>
 
-[pkgs.org/nvidia-vaapi-driver](https://pkgs.org/search/?q=nvidia-vaapi-driver) [pkgs.org/libva-nvidia-driver](https://pkgs.org/search/?q=libva-nvidia-driver)
+[pkgs.org/nvidia-vaapi-driver](https://pkgs.org/search/?q=nvidia-vaapi-driver) | [pkgs.org/libva-nvidia-driver](https://pkgs.org/search/?q=libva-nvidia-driver)
 
-openSUSE: [1](https://software.opensuse.org/package/nvidia-vaapi-driver), [2](https://software.opensuse.org/package/libva-nvidia-driver).
-
-Feel free to add your distributions package in an issue/PR, if it isn't on these websites.
+openSUSE: [1](https://software.opensuse.org/package/nvidia-vaapi-driver), [2](https://software.opensuse.org/package/libva-nvidia-driver)
 
 ## Building
 
-You'll need `meson`, the `gstreamer-plugins-bad` library, and [`nv-codec-headers`](https://git.videolan.org/?p=ffmpeg/nv-codec-headers.git) installed.
+Dependencies: `meson`, `gstreamer-plugins-bad`, [`nv-codec-headers`](https://git.videolan.org/?p=ffmpeg/nv-codec-headers.git)
 
-| Package manager | Packages                                        | Optional packages for additional codec support |
-|-----------------|-------------------------------------------------|------------------------------------------------|
-| pacman          | meson gst-plugins-bad ffnvcodec-headers         |                                                |
-| apt             | meson gstreamer1.0-plugins-bad libffmpeg-nvenc-dev libva-dev libegl-dev libdrm-dev | libgstreamer-plugins-bad1.0-dev   |
-| yum/dnf         | meson libva-devel gstreamer1-plugins-bad-freeworld nv-codec-headers libdrm-devel | gstreamer1-plugins-bad-free-devel |
+| Package manager | Required | Optional (additional codecs) |
+|-----------------|----------|------------------------------|
+| pacman | meson gst-plugins-bad ffnvcodec-headers | |
+| apt | meson gstreamer1.0-plugins-bad libffmpeg-nvenc-dev libva-dev libegl-dev libdrm-dev | libgstreamer-plugins-bad1.0-dev |
+| yum/dnf | meson libva-devel gstreamer1-plugins-bad-freeworld nv-codec-headers libdrm-devel | gstreamer1-plugins-bad-free-devel |
 
-Then run the following commands:
+Build commands:
 
 ```sh
 meson setup build
@@ -96,127 +96,168 @@ meson install -C build
 
 ## Removal
 
-By default the driver installs itself as `/usr/lib64/dri/nvidia_drv_video.so` (this might be `/usr/lib/x86_64-linux-gnu/dri/nvidia_drv_video.so` on some distros). To uninstall the driver, simply remove this file. In addition, this file is usually symlinked to `/usr/lib64/dri/vdpau_drv_video.so` (or `/usr/lib/x86_64-linux-gnu/dri/vdpau_drv_video.so`) if the VDPAU to VA-API driver is installed, so this symlink will need to be restored for that driver to work normally again.
+Default install location: `/usr/lib64/dri/nvidia_drv_video.so` (or `/usr/lib/x86_64-linux-gnu/dri/nvidia_drv_video.so` on Debian-based distros).
+
+Delete this file to uninstall. If VDPAU-to-VAAPI driver was installed, restore symlink at `/usr/lib64/dri/vdpau_drv_video.so`.
 
 # Configuration
 
 ## Upstream regressions
 
-The EGL backend is broken on driver versions 525 or later due to a regression. Users running these drivers should use the [direct backend](#direct-backend) instead.
+EGL backend broken on driver 525+. Use [direct backend](#direct-backend) instead.
 
-For more information read the [upstream bug report](https://forums.developer.nvidia.com/t/cueglstreamproducerconnect-returns-error-801-on-525-53-driver/233610) or [issue #126](/../../issues/126).
+Details: [upstream bug report](https://forums.developer.nvidia.com/t/cueglstreamproducerconnect-returns-error-801-on-525-53-driver/233610), [issue #126](/../../issues/126).
 
 ## Kernel parameters
 
-This library requires that the `nvidia_drm` kernel module is [configured with the parameter](https://wiki.archlinux.org/title/Kernel_parameters) `nvidia-drm.modeset=1`
+Required kernel module parameter:
+
+```
+nvidia-drm.modeset=1
+```
+
+Set via [kernel parameters](https://wiki.archlinux.org/title/Kernel_parameters).
 
 ## Environment Variables
 
-Environment variables used to control the behavior of this library.
-
-| Variable | Purpose |
+| Variable | Function |
 |---|---|
-| `NVD_LOG` | Used to control logging. `1` to log to stdout, anything else to append to the given file. |
-| `NVD_MAX_INSTANCES` | Controls the maximum concurrent instances of the driver will be allowed per-process. This option is only really useful for older GPUs with not much VRAM, especially with Firefox on video heavy websites. |
-| `NVD_BACKEND` | Controls which backend this library uses. Either `egl`, or `direct` (default). See [direct backend](#direct-backend) for more details. |
+| `NVD_LOG` | `1` = log to stdout. Any other value = append to that file path. |
+| `NVD_MAX_INSTANCES` | Cap concurrent driver instances per-process. Useful for low-VRAM GPUs on video-heavy sites. |
+| `NVD_BACKEND` | `egl` or `direct` (default). Direct bypasses broken EGL path on 525+ drivers. |
 
 ## Firefox
 
-Due to license, Firefox on Linux does not support HEVC till now.
-To use the driver with firefox you will need at least Firefox 96, `ffmpeg` compiled with vaapi support (`ffmpeg -hwaccels` output should include vaapi), and the following config options need to be set in the `about:config` page:
+Firefox on Linux lacks HEVC due to licensing.
+
+Minimum: Firefox 96, `ffmpeg` with VA-API support (`ffmpeg -hwaccels` must list `vaapi`).
+
+**about:config settings:**
 
 | Option | Value | Reason |
 |---|---|---|
-| media.ffmpeg.vaapi.enabled | true | Required until Firefox 137, enables the use of VA-API. |
-| media.hardware-video-decoding.force-enabled | true | Required since Firefox 137, enables hardware acceleration. |
-| media.rdd-ffmpeg.enabled | true | Required, default on FF97. Forces ffmpeg usage into the RDD process, rather than the content process. |
-| media.av1.enabled | false | Optional, disables AV1. If your GPU doesn't support AV1, this will prevent sites using it and falling back to software decoding. |
-| gfx.x11-egl.force-enabled | true | Required, this driver requires that Firefox use the EGL backend. It may be enabled by default. It is recommended to test it with the `MOZ_X11_EGL=1` environment variable before enabling it in the Firefox configuration. |
-| widget.dmabuf.force-enabled | true | Required on NVIDIA 470 series drivers. Note that Firefox isn't coded to allow DMA-BUF support without GBM support, so it may not function completely correctly when it's forced on. |
+| media.ffmpeg.vaapi.enabled | true | Enables VA-API (required until Firefox 137) |
+| media.hardware-video-decoding.force-enabled | true | Enables HW accel (required Firefox 137+) |
+| media.rdd-ffmpeg.enabled | true | Forces ffmpeg into RDD process (default FF97+) |
+| media.av1.enabled | false | Disable if GPU lacks AV1 to prevent software fallback |
+| gfx.x11-egl.force-enabled | true | Driver requires EGL backend. Test with `MOZ_X11_EGL=1` first. |
+| widget.dmabuf.force-enabled | true | Required on 470 series. DMA-BUF without GBM may cause partial failures. |
 
-In addition the following environment variables need to be set. For permanent configuration `/etc/environment` may suffice.
+**Environment variables:**
 
 | Variable | Value | Reason |
 |---|---|---|
-| MOZ_DISABLE_RDD_SANDBOX | 1 | Disables the sandbox for the RDD process that the decoder runs in. |
-| LIBVA_DRIVER_NAME | nvidia | Required for libva 2.20+, forces libva to load this driver. |
-| __EGL_VENDOR_LIBRARY_FILENAMES | /usr/share/glvnd/egl_vendor.d/10_nvidia.json | Required for the 470 driver series only. It overrides the list of drivers the glvnd library can use to prevent Firefox from using the MESA driver by mistake. |
-| CUDA_DISABLE_PERF_BOOST | 1 | Optional. Requires NVIDIA driver >= 580.105.08. Disables the forced power boost the GPU gets when CUDA is activated. This should reduce the power usage when decoding video. This setting is the equivilent of the 'CUDA Force P2' NVIDIA Profile Inspector setting on Windows. |
+| MOZ_DISABLE_RDD_SANDBOX | 1 | Disables RDD process sandbox for decoder access |
+| LIBVA_DRIVER_NAME | nvidia | Required for libva 2.20+. Forces this driver. |
+| __EGL_VENDOR_LIBRARY_FILENAMES | /usr/share/glvnd/egl_vendor.d/10_nvidia.json | 470 series only. Prevents MESA driver selection. |
+| CUDA_DISABLE_PERF_BOOST | 1 | Driver 580.105.08+. Reduces power during decode (equivalent to Windows CUDA Force P2). |
 
-When libva is used it will log out some information, which can be excessive when Firefox initalises it multiple times per page. This logging can be suppressed by adding the following line to the `/etc/libva.conf` file:
+Suppress libva init spam by adding to `/etc/libva.conf`:
 ```
 LIBVA_MESSAGING_LEVEL=1
 ```
 
-If you're using the Snap version of Firefox, it will be unable to access the host version of the driver that is installed.
+Snap Firefox cannot access host-installed drivers.
 
-## Chrome
+## Chromium-Based Browsers
 
-Chrome support is experimental. For RTX 5090 (Blackwell) and other modern GPUs, use:
+Supported: Chrome, Chromium, Thorium, Brave, Edge, Vivaldi, Opera
 
-**Environment Variables:**
+Driver auto-detects Chromium-based browsers via `/proc/self/exe` and applies format compatibility workarounds.
+
+**Environment:**
 ```bash
 export LIBVA_DRIVER_NAME=nvidia
 export NVD_BACKEND=direct
+export FORCENVDEC=1  # Force NVDEC path regardless of browser detection
 ```
 
-**Chrome Launch Flags:**
+**Launch flags (all Chromium browsers):**
 ```bash
+# Chrome/Chromium
 google-chrome \
   --enable-features=VaapiVideoDecodeLinuxGL,VaapiVideoDecoder \
   --disable-features=UseChromeOSDirectVideoDecoder \
   --use-gl=egl \
   --enable-gpu-rasterization
+
+# Thorium (VA-API enabled by default, but add for explicit control)
+thorium-browser \
+  --enable-features=VaapiVideoDecodeLinuxGL,VaapiVideoDecoder \
+  --use-gl=egl
+
+# Brave
+brave-browser \
+  --enable-features=VaapiVideoDecodeLinuxGL,VaapiVideoDecoder \
+  --disable-features=UseChromeOSDirectVideoDecoder \
+  --use-gl=egl
 ```
 
-**If NVDEC utilization remains at 0%:**
+**Troubleshooting zero NVDEC utilization:**
 
-1. The Chrome GPU sandbox may be blocking IOCTLs:
+1. GPU sandbox blocking IOCTLs:
    ```bash
    google-chrome --disable-gpu-sandbox [other flags]
    ```
-   Note: This reduces security. Only use for testing.
+   Security tradeoff. Testing only.
 
-2. Enable debug logging to diagnose:
+2. Debug logging:
    ```bash
-   NVD_LOG=1 google-chrome [flags] 2>&1 | tee nvd-debug.log
+   NVD_LOG=1 thorium-browser [flags] 2>&1 | tee nvd-debug.log
    ```
 
-3. Run the validation script:
+3. Validation script:
    ```bash
    ./scripts/validate-nvdec.sh
    ```
 
-**Streaming Sites (Kick.com, Twitch):**
+**Streaming sites (Kick.com, Twitch, YouTube):**
 
-These sites use Low Latency H.264/AV1 profiles. Blackwell's NVDEC has optimized power states for low-latency decode. If decoder utilization shows 0% but memory/encoder shows spikes, the driver may be crashing during handover. Check `dmesg` for NVIDIA errors.
+Low Latency H.264/AV1 profiles use Blackwell's optimized power states. If utilization shows 0% but memory/encoder spikes, driver may crash during handover. Check `dmesg` for NVIDIA errors.
+
+**Thorium-specific notes:**
+
+Thorium ships with VA-API patches pre-applied. No additional chrome://flags configuration needed. Set environment variables and launch flags as above.
 
 ## MPV
 
-Currently this only works with a recent MPV version (at least 0.36.0).
+Requires MPV 0.36.0+.
 
-There's no real reason to run it with mpv except for testing, as mpv already supports using nvdec directly. The `test.sh` script will run mpv with the file provided and various environment variables set to use the newly built driver
+MPV already supports nvdec directly. This driver is only useful for testing. Use `test.sh` to run MPV with the built driver and correct environment.
 
 ## Direct Backend
 
-The direct backend is a experimental backend that accesses the NVIDIA kernel driver directly, rather than using EGL to share the buffers. This allows us
-a greater degree of control over buffer allocation and freeing.
+Accesses NVIDIA kernel driver directly instead of EGL buffer sharing. Provides finer control over buffer allocation.
 
-The direct backend has been tested on a variety of hardware from the Kepler to Blackwell generations (including RTX 5090), and seems to be working fine. If you find any compatibility issues, please leave a comment [here](/../../issues/126).
+Tested: Kepler through Blackwell (including RTX 5090). Report issues at [#126](/../../issues/126) with `NVD_LOG=1` output.
 
-Given this backend accesses the NVIDIA driver directly, via NVIDIA's unstable API, this module is likely to break often with new versions of the kernel driver. If you encounter issues using this backend raise an issue and including logs generated by `NVD_LOG=1`.
-
-This backend uses headers files from the NVIDIA [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules)
-project. The `extract_headers.sh` script, along with the `headers.in` file list which files we need, and will copy them from a checked out version of the NVIDIA project to the `nvidia-include` directory. This is done to prevent everyone needing to checkout that project.
+This backend uses NVIDIA's unstable internal API. Kernel driver updates will break it. Headers from [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) copied to `nvidia-include/` via `extract_headers.sh` and `headers.in`.
 
 # Testing
 
-To verify that the driver is being used to decode video, you can use nvidia-settings or nvidia-smi.
+Verify decoder activity:
 
-- nvidia-settings
+**nvidia-settings:** Select GPU → check `Video Engine Utilization` (non-zero during playback).
 
-  By selecting the relevant GPU on the left of the nvidia-settings window, it will show `Video Engine Utilization` on the right. While playing a video this value should be non-zero.
+**nvidia-smi:** Running during decode shows Firefox with `C` in `Type` column. `nvidia-smi pmon` shows per-process decode usage. `nvidia-smi dmon` shows per-GPU usage. Open kernel modules may misreport decode engine usage.
 
-- nvidia-smi
+# Blackwell-Specific Notes
 
-  Running `nvidia-smi` while decoding a video should show a Firefox process with `C` in the `Type` column. In addition `nvidia-smi pmon` will show the usage of the decode engine per-process, and `nvidia-smi dmon` will show the usage per-GPU. When using nvidia open gpu kernel modules, the usage of the decode engine may not be displayed correctly.
+RTX 5090 (GB202) and RTX 5080 (GB203) require:
+
+- Driver 580.0+ (NVDEC interface definitions added in this version)
+- Kernel 6.17+ recommended for DRM compatibility
+- Direct backend (`NVD_BACKEND=direct`)
+
+PCI Device IDs added in this fork:
+- GB202: 0x2684, 0x2685, 0x2686, 0x2687 (RTX 5090 variants)
+- GB203: 0x2688, 0x2689, 0x268A, 0x268B (RTX 5080 variants)
+
+NVENC detection is dynamic. Driver queries `nvEncodeAPIGetMaxSupportedVersion` at runtime instead of static capability tables.
+
+Chrome browser detection implemented for format compatibility workarounds specific to Chromium's VA-API layer.
+
+---
+
+**Sweetflips Blackwell Compatibility Kernel Project**
+https://github.com/Sweetflips/nvidia-vaapi-driver-5090-blackwell
